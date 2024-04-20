@@ -1,0 +1,209 @@
+---
+- hosts: all
+  become: yes
+  vars:
+    java_packages:
+      - java-17-amazon-corretto-devel
+    jenkins_packages:
+      - jenkins  
+    jenkins_home: /var/lib/jenkins  # Default Jenkins home directory
+    admin_user: adm-radub
+    admin_password: Pass1234!@#$
+    init_groovy_dir: "{{ jenkins_home }}/init.groovy.d"
+
+  tasks:
+    - name: Download Jenkins repository file
+      get_url:
+        url: https://pkg.jenkins.io/redhat-stable/jenkins.repo
+        dest: /etc/yum.repos.d/jenkins.repo
+      become: true
+
+    - name: Import Jenkins-CI key
+      shell: rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+      become: true
+
+    - name: Install Java
+      yum:
+        name: "{{ java_packages }}"
+        state: present
+      become: true
+
+    - name: Install Jenkins
+      yum:
+        name: "{{ jenkins_packages }}"
+        state: present
+      become: true
+
+    - name: Start Jenkins service
+      service:
+        name: jenkins
+        state: started
+      become: true
+
+    - name: Check that the /etc/default/jenkins exists
+      stat:
+        path: /etc/default/jenkins
+      register: stat_result
+
+    - name: Create the file, if it doesnt exist already
+      file:
+        path: /etc/default/jenkins
+        state: touch
+        mode: '0755'
+      when: not stat_result.stat.exists
+
+    - name: Disable Jenkins Setup Wizard
+      lineinfile:
+          dest=/etc/default/jenkins
+          regexp='^JENKINS_JAVA_OPTIONS='
+          line='JENKINS_JAVA_OPTIONS="-Djava.awt.headless=true -Djenkins.install.runSetupWizard=false"'
+      become: true
+
+    - name: Restart Jenkins to apply changes
+      service:
+        name: jenkins
+        state: restarted
+      become: true
+
+    - name: pause for 30 seconds
+      pause:
+        seconds: 30
+
+    - name: Ensure init.groovy.d directory exists
+      file:
+        path: "{{ init_groovy_dir }}"
+        state: directory
+        mode: '0777'
+      become: true
+
+    - name: Create Admin User Script
+      copy:
+        content: |
+          #!groovy
+          import hudson.security.*
+          import jenkins.model.*
+          import hudson.security.csrf.DefaultCrumbIssuer
+          def instance = Jenkins.getInstance()
+          def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+          def users = hudsonRealm.getAllUsers()
+          instance.setCrumbIssuer(new DefaultCrumbIssuer(true))
+          instance.save()
+          users_s = users.collect { it.toString() } 
+
+          // Create the admin user account if it doesn't already exist.
+          if ("{{ admin_user }}" in users_s) {
+              println "Admin user already exists - updating password"
+
+              def user = hudson.model.User.get('{{ admin_user }}');
+              def password = hudson.security.HudsonPrivateSecurityRealm.Details.fromPlainPassword('{{ admin_password }}')
+              user.addProperty(password)
+              user.save()
+          }
+          else {
+              println "--> creating local admin user"
+
+              hudsonRealm.createAccount('{{ admin_user }}', '{{ admin_password }}')
+              instance.setSecurityRealm(hudsonRealm)
+
+              def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+              instance.setAuthorizationStrategy(strategy)
+              instance.save()
+          }
+        dest: "{{ jenkins_home }}/init.groovy.d/createAdminUser.groovy"
+        owner: jenkins
+        group: jenkins
+        mode: '0777'
+      become: true
+
+    - name: Ensure the Job Plugins are installed
+      copy:
+        content: |
+          #!groovy
+          import jenkins.*
+          import jenkins.model.*
+          import hudson.*
+          import hudson.model.*
+
+          // Plugin short names and optional versions
+          def pluginsToInstall = [
+            [id: 'job-dsl'],
+            [id: 'workflow-job'],
+            [id: 'workflow-aggregator']
+          ]
+
+          def updateCenter = Jenkins.instance.updateCenter
+          def installedPlugins = Jenkins.instance.pluginManager.plugins
+
+          // Filter out already installed plugins
+          def pluginsToInstallFiltered = pluginsToInstall.findAll { plugin ->
+            installedPlugins.every { installedPlugin ->
+              !installedPlugin.getShortName().equals(plugin.id) || (plugin.version && !installedPlugin.getVersion().equals(plugin.version))
+            }
+          }
+
+          // Install the filtered plugins
+          pluginsToInstallFiltered.each { plugin ->
+            def pluginId = plugin.version ? "${plugin.id}@${plugin.version}" : plugin.id
+            println("Installing plugin: ${pluginId}")
+            updateCenter.getPlugin(plugin.id).deploy().get()
+          }
+
+          if (!pluginsToInstallFiltered.isEmpty()) {
+            Jenkins.instance.safeRestart()
+          }
+        dest: "{{ jenkins_home }}/init.groovy.d/install-job-dsl-plugin.groovy"
+        owner: jenkins
+        group: jenkins
+        mode: '0777'
+      become: true
+
+    - name: pause for 30 seconds
+      pause:
+        seconds: 30
+
+    - name: Ensure the DSL directory exists
+      file:
+        path: "{{ jenkins_home }}/dsl"
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: '0777'
+      become: true
+
+    - name: Copy 'Hello World' DSL script to Jenkins server
+      copy:
+        src: ./hello_world.dsl
+        dest: "{{ jenkins_home }}/dsl/hello_world_job.dsl"
+        owner: jenkins
+        group: jenkins
+        mode: '0777'
+      become: true
+
+    - name: Create 'Hello World' Pipeline
+      copy:
+        content: |
+          #!groovy
+          import javaposse.jobdsl.dsl.DslScriptLoader
+          import javaposse.jobdsl.plugin.JenkinsJobManagement
+          import java.io.File
+
+          String pathToDsl = "/var/lib/jenkins/dsl/hello_world_job.dsl"
+          String jobDslScript = new File(pathToDsl).text
+
+          JenkinsJobManagement jobManagement = new JenkinsJobManagement(
+              System.out, new HashMap<>(), new File("."))
+          DslScriptLoader scriptLoader = new DslScriptLoader(jobManagement)
+
+          scriptLoader.runScript(jobDslScript)
+
+        dest: "{{ jenkins_home }}/init.groovy.d/hello_world.groovy"
+        owner: jenkins
+        group: jenkins
+        mode: '0777'
+      become: true
+
+    - name: Restart Jenkins to apply changes
+      service:
+        name: jenkins
+        state: restarted
+      become: true
